@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
 字幕 + 淡入淡出检测（不剪辑视频）：
-1) ffmpeg 按指定采样率抽帧（默认 1fps）。
-2) 每帧整图送入 PP-OCRv4（PaddleOCR）做字幕检测。
-3) 检测淡入淡出并将结果与字幕一起写入同一个 JSON。
-
-注意：
-- 不修改原视频。
-- 需要 ffmpeg/ffprobe 与 paddleocr 依赖。
+1) ffmpeg 抽帧（字幕默认 1fps，淡入淡出可独立高采样）。
+2) 字幕双通道检测：
+   - OCR 识别分数通道（常规字幕）
+   - 文本区域通道（仅看检测框面积，覆盖艺术字/水印）
+3) 淡入淡出检测（亮度/对比度时序）。
+4) 输出单个 JSON。
 """
 
 from __future__ import annotations
@@ -53,19 +52,21 @@ class SubtitleSegment:
 
 @dataclass
 class FadeSegment:
-    fade_type: str  # fade_in / fade_out
+    fade_type: str
     start_s: float
     end_s: float
 
 
 @dataclass
-class VideoSubtitleResult:
+class VideoResult:
     video_name: str
     video_path: str
     fps: float
     total_frames: int
     duration_s: float
     has_subtitle: bool
+    has_subtitle_ocr: bool
+    has_subtitle_region: bool
     subtitle_segments: List[SubtitleSegment]
     has_fade: bool
     fade_segments: List[FadeSegment]
@@ -73,33 +74,26 @@ class VideoSubtitleResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="基于 PP-OCRv4 的字幕+淡入淡出检测（仅输出 JSON）。")
+    parser = argparse.ArgumentParser(description="字幕+淡入淡出检测（仅输出 JSON）。")
     parser.add_argument("--input-dir", type=Path, required=True, help="输入视频目录")
     parser.add_argument("--recursive", action="store_true", help="递归扫描子目录")
-    parser.add_argument(
-        "--json-path",
-        type=Path,
-        default=Path("subtitle_report.json"),
-        help="输出 JSON 路径（默认当前目录 subtitle_report.json）",
-    )
-    parser.add_argument("--score-threshold", type=float, default=0.85, help="OCR 置信度阈值")
-    parser.add_argument("--sample-fps", type=float, default=1.0, help="采样率（fps），默认 1.0")
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=min(11, max(1, (os.cpu_count() or 2) - 1)),
-        help="并行进程数，默认 min(11, CPU核数-1)",
-    )
-    parser.add_argument("--lang", type=str, default="en", help="PaddleOCR 语言模型，如 ch/en")
-    parser.add_argument("--no-angle-cls", action="store_true", help="关闭方向分类以加速")
+    parser.add_argument("--json-path", type=Path, default=Path("subtitle_report.json"), help="输出 JSON 路径")
 
-    # Fade 参数
-    parser.add_argument("--fade-dark-threshold", type=float, default=45.0, help="淡入淡出暗场阈值（0~255）")
-    parser.add_argument("--fade-min-delta", type=float, default=150.0, help="淡入淡出最小亮度变化")
-    parser.add_argument("--fade-min-duration", type=float, default=0.1, help="淡入淡出最短持续时长（秒）")
-    parser.add_argument("--fade-max-duration", type=float, default=5.0, help="淡入淡出最长持续时长（秒）")
-    parser.add_argument("--fade-sample-fps", type=float, default=10.0, help="淡入淡出检测采样率（fps）")
-    parser.add_argument("--fade-scale-width", type=int, default=224, help="淡入淡出检测缩放宽度")
+    parser.add_argument("--sample-fps", type=float, default=1.0, help="字幕检测采样率（fps）")
+    parser.add_argument("--score-threshold", type=float, default=0.85, help="OCR 分数阈值")
+    parser.add_argument("--subtitle-min-hit-frames", type=int, default=2, help="字幕判定最小连续命中帧数")
+    parser.add_argument("--region-min-area-ratio", type=float, default=0.015, help="文本区域最小面积占比")
+
+    parser.add_argument("--workers", type=int, default=min(11, max(1, (os.cpu_count() or 2) - 1)), help="并行进程数")
+    parser.add_argument("--lang", type=str, default="en", help="PaddleOCR 语言模型")
+    parser.add_argument("--no-angle-cls", action="store_true", help="关闭方向分类")
+
+    parser.add_argument("--fade-dark-threshold", type=float, default=45.0)
+    parser.add_argument("--fade-min-delta", type=float, default=35.0)
+    parser.add_argument("--fade-min-duration", type=float, default=0.5)
+    parser.add_argument("--fade-max-duration", type=float, default=3.0)
+    parser.add_argument("--fade-sample-fps", type=float, default=8.0)
+    parser.add_argument("--fade-scale-width", type=int, default=192)
     return parser.parse_args()
 
 
@@ -149,7 +143,6 @@ def get_ocr(lang: str, use_textline_orientation: bool) -> PaddleOCR:
             },
             {"lang": lang},
         ]
-
         last_error: Exception | None = None
         for kwargs in candidates:
             try:
@@ -211,57 +204,105 @@ def ffprobe_video_meta(video_path: Path) -> Tuple[float, int, float, int, int]:
     return fps, total_frames, duration_s, width, height
 
 
-def ocr_frame_hit(frame_bgr: np.ndarray, score_threshold: float, lang: str, use_textline_orientation: bool) -> bool:
-    ocr = get_ocr(lang=lang, use_textline_orientation=use_textline_orientation)
-    result = ocr.ocr(frame_bgr)
-    if not result:
-        return False
-
-    # 兼容旧版格式：[[[box], [text, score]], ...]
-    if isinstance(result, list) and len(result) > 0 and isinstance(result[0], list):
-        lines = result[0]
-        for line in lines:
-            if not isinstance(line, (list, tuple)) or len(line) < 2:
-                continue
-            rec = line[1]
-            if not isinstance(rec, (list, tuple)) or len(rec) < 2:
-                continue
-            try:
-                if float(rec[1]) > score_threshold:
-                    return True
-            except (TypeError, ValueError):
-                continue
-
-    # 兼容新版格式：[{..., "rec_scores": [...], ...}, ...]
-    if isinstance(result, list):
-        for item in result:
-            if not isinstance(item, dict):
-                continue
-            scores = item.get("rec_scores")
-            if not isinstance(scores, list):
-                continue
-            for sc in scores:
-                try:
-                    if float(sc) > score_threshold:
-                        return True
-                except (TypeError, ValueError):
-                    continue
-
-    return False
-
-
 def frame_ranges_from_flags(flags: Sequence[bool]) -> List[Tuple[int, int]]:
     ranges: List[Tuple[int, int]] = []
     start = None
     for i, f in enumerate(flags):
         if f and start is None:
             start = i
-        if not f and start is not None:
+        if (not f) and start is not None:
             ranges.append((start, i - 1))
             start = None
     if start is not None:
         ranges.append((start, len(flags) - 1))
     return ranges
+
+
+def keep_only_long_true_runs(flags: Sequence[bool], min_len: int) -> List[bool]:
+    if min_len <= 1:
+        return list(flags)
+    out = [False] * len(flags)
+    for s, e in frame_ranges_from_flags(flags):
+        if (e - s + 1) >= min_len:
+            for i in range(s, e + 1):
+                out[i] = True
+    return out
+
+
+def parse_ocr_result(result: Any) -> Tuple[List[float], List[np.ndarray]]:
+    scores: List[float] = []
+    boxes: List[np.ndarray] = []
+
+    if not isinstance(result, list):
+        return scores, boxes
+
+    # 旧版：result[0] -> [[box, [text, score]], ...]
+    if len(result) > 0 and isinstance(result[0], list):
+        for line in result[0]:
+            if isinstance(line, (list, tuple)) and len(line) >= 2:
+                box = line[0]
+                rec = line[1]
+                try:
+                    if isinstance(rec, (list, tuple)) and len(rec) >= 2:
+                        scores.append(float(rec[1]))
+                except Exception:
+                    pass
+                try:
+                    arr = np.asarray(box, dtype=np.float32)
+                    if arr.ndim == 2 and arr.shape[0] >= 3 and arr.shape[1] == 2:
+                        boxes.append(arr)
+                except Exception:
+                    pass
+
+    # 新版：dict 结构，可能含 rec_scores / dt_polys
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        rs = item.get("rec_scores")
+        if isinstance(rs, list):
+            for x in rs:
+                try:
+                    scores.append(float(x))
+                except Exception:
+                    pass
+        polys = item.get("dt_polys")
+        if isinstance(polys, list):
+            for p in polys:
+                try:
+                    arr = np.asarray(p, dtype=np.float32)
+                    if arr.ndim == 2 and arr.shape[0] >= 3 and arr.shape[1] == 2:
+                        boxes.append(arr)
+                except Exception:
+                    pass
+
+    return scores, boxes
+
+
+def subtitle_dual_channel_hit(
+    frame_bgr: np.ndarray,
+    score_threshold: float,
+    region_min_area_ratio: float,
+    lang: str,
+    use_textline_orientation: bool,
+) -> Tuple[bool, bool]:
+    ocr = get_ocr(lang=lang, use_textline_orientation=use_textline_orientation)
+    result = ocr.ocr(frame_bgr)
+    if not result:
+        return False, False
+
+    scores, boxes = parse_ocr_result(result)
+    ocr_hit = any(s > score_threshold for s in scores)
+
+    h, w = frame_bgr.shape[:2]
+    frame_area = float(max(h * w, 1))
+    region_hit = False
+    for b in boxes:
+        area = float(abs(np.cross(b[1] - b[0], b[2] - b[0]))) if b.shape[0] >= 3 else 0.0
+        if area / frame_area >= region_min_area_ratio:
+            region_hit = True
+            break
+
+    return ocr_hit, region_hit
 
 
 def detect_subtitle_segments(
@@ -271,22 +312,18 @@ def detect_subtitle_segments(
 ) -> List[SubtitleSegment]:
     if not sample_times_s or not sample_hits:
         return []
-
-    segments: List[SubtitleSegment] = []
+    segs: List[SubtitleSegment] = []
     for s, e in frame_ranges_from_flags(sample_hits):
-        segments.append(
-            SubtitleSegment(start_s=round(sample_times_s[s], 3), end_s=round(sample_times_s[e] + sample_interval_s, 3))
-        )
+        segs.append(SubtitleSegment(round(sample_times_s[s], 3), round(sample_times_s[e] + sample_interval_s, 3)))
 
-    # 原规则保留：两段字幕间隔等于 1 秒时合并
-    if not segments:
-        return segments
-    merged: List[SubtitleSegment] = [segments[0]]
-    for seg in segments[1:]:
+    if not segs:
+        return segs
+    # 保留你之前的规则：间隔 1 秒合并
+    merged: List[SubtitleSegment] = [segs[0]]
+    for seg in segs[1:]:
         prev = merged[-1]
-        gap = seg.start_s - prev.end_s
-        if abs(gap - 1.0) <= 1e-3:
-            merged[-1] = SubtitleSegment(start_s=prev.start_s, end_s=seg.end_s)
+        if abs((seg.start_s - prev.end_s) - 1.0) <= 1e-3:
+            merged[-1] = SubtitleSegment(prev.start_s, seg.end_s)
         else:
             merged.append(seg)
     return merged
@@ -311,11 +348,8 @@ def detect_fade_segments(
     n = min(len(t), len(b), len(c))
     if n < 2:
         return []
-    t = t[:n]
-    b = b[:n]
-    c = c[:n]
+    t, b, c = t[:n], b[:n], c[:n]
 
-    # 轻量平滑，减少抖动误检
     kernel = np.array([0.25, 0.5, 0.25], dtype=np.float32)
     b_smooth = np.convolve(b, kernel, mode="same")
     diff = np.diff(b_smooth)
@@ -325,155 +359,84 @@ def detect_fade_segments(
     slope_thr = max(1.0, float(np.std(diff)) * 0.8)
     min_frames = max(1, int(round(min_duration / max(sample_interval_s, 1e-6))))
     max_frames = max(min_frames, int(round(max_duration / max(sample_interval_s, 1e-6))))
-
-    fades: List[FadeSegment] = []
-
-    # 全局对比度参考：真正淡入淡出靠近黑场时通常对比度会明显变低
     contrast_ref = float(np.percentile(c, 60))
     contrast_dark_limit = max(8.0, contrast_ref * 0.55)
 
-    # 片头特判：在片头窗口内先找低谷，再找后续峰值，适配“不从第0帧开始”的淡入
+    fades: List[FadeSegment] = []
+
+    # 片头低谷->峰值
     head_end = min(n - 1, int(round(max_frames * 1.5)))
     if head_end >= 2:
         head_curve = b_smooth[: head_end + 1]
         head_contrast = c[: head_end + 1]
         low_idx = int(np.argmin(head_curve))
         if low_idx < head_end:
-            rise_curve = head_curve[low_idx:]
-            high_rel = int(np.argmax(rise_curve))
-            high_idx = low_idx + high_rel
+            high_idx = low_idx + int(np.argmax(head_curve[low_idx:]))
             if high_idx > low_idx:
-                head_delta = float(b_smooth[high_idx] - b_smooth[low_idx])
-                head_dur = float(t[high_idx] - t[low_idx]) + sample_interval_s
+                delta = float(b_smooth[high_idx] - b_smooth[low_idx])
+                dur = float(t[high_idx] - t[low_idx]) + sample_interval_s
                 local_diff = diff[low_idx:high_idx]
-                if len(local_diff) > 0:
-                    up_ratio = float(np.mean(local_diff >= (-slope_thr * 0.2)))
-                else:
-                    up_ratio = 0.0
-
+                up_ratio = float(np.mean(local_diff >= (-slope_thr * 0.2))) if len(local_diff) > 0 else 0.0
                 if (
-                    head_delta >= (min_delta * 0.45)
-                    and head_dur >= (min_duration * 0.3)
-                    and head_dur <= (max_duration * 1.2)
+                    delta >= (min_delta * 0.45)
+                    and dur >= (min_duration * 0.3)
+                    and dur <= (max_duration * 1.2)
                     and up_ratio >= 0.65
                     and float(np.min(head_curve[: max(low_idx + 1, min_frames)])) <= (dark_threshold + 25.0)
                     and float(np.min(head_contrast[: max(low_idx + 1, min_frames)])) <= contrast_dark_limit
                 ):
-                    fades.append(
-                        FadeSegment(
-                            "fade_in",
-                            round(float(t[low_idx]), 3),
-                            round(float(t[high_idx] + sample_interval_s), 3),
-                        )
-                    )
+                    fades.append(FadeSegment("fade_in", round(float(t[low_idx]), 3), round(float(t[high_idx] + sample_interval_s), 3)))
 
-    # 片尾：在片尾窗口内先找高峰，再找后续低谷，覆盖结尾淡出
+    # 片尾高峰->低谷
     tail_start = max(0, n - int(round(max_frames * 1.5)) - 1)
     if tail_start < n - 2:
-        tail_curve = b_smooth[tail_start:]
-        tail_contrast = c[tail_start:]
-        high_rel = int(np.argmax(tail_curve))
-        high_idx = tail_start + high_rel
+        high_idx = tail_start + int(np.argmax(b_smooth[tail_start:]))
         if high_idx < n - 1:
-            low_rel = int(np.argmin(b_smooth[high_idx:]))
-            low_idx = high_idx + low_rel
+            low_idx = high_idx + int(np.argmin(b_smooth[high_idx:]))
             if low_idx > high_idx:
-                tail_delta = float(b_smooth[high_idx] - b_smooth[low_idx])
-                tail_dur = float(t[low_idx] - t[high_idx]) + sample_interval_s
+                delta = float(b_smooth[high_idx] - b_smooth[low_idx])
+                dur = float(t[low_idx] - t[high_idx]) + sample_interval_s
                 local_diff = diff[high_idx:low_idx]
-                if len(local_diff) > 0:
-                    down_ratio = float(np.mean(local_diff <= (slope_thr * 0.2)))
-                else:
-                    down_ratio = 0.0
+                down_ratio = float(np.mean(local_diff <= (slope_thr * 0.2))) if len(local_diff) > 0 else 0.0
+                low_contrast = float(np.min(c[max(high_idx, low_idx - min_frames + 1): low_idx + 1]))
+                low_dark = float(np.min(b_smooth[max(high_idx, low_idx - min_frames + 1): low_idx + 1]))
                 if (
-                    tail_delta >= (min_delta * 0.45)
-                    and tail_dur >= (min_duration * 0.3)
-                    and tail_dur <= (max_duration * 1.2)
+                    delta >= (min_delta * 0.45)
+                    and dur >= (min_duration * 0.3)
+                    and dur <= (max_duration * 1.2)
                     and down_ratio >= 0.65
-                    and float(np.min(tail_curve[max(0, low_rel - min_frames + 1): low_rel + 1])) <= (dark_threshold + 25.0)
-                    and float(np.min(tail_contrast[max(0, low_rel - min_frames + 1): low_rel + 1])) <= contrast_dark_limit
+                    and low_dark <= (dark_threshold + 25.0)
+                    and low_contrast <= contrast_dark_limit
                 ):
-                    fades.append(
-                        FadeSegment(
-                            "fade_out",
-                            round(float(t[high_idx]), 3),
-                            round(float(t[low_idx] + sample_interval_s), 3),
-                        )
-                    )
+                    fades.append(FadeSegment("fade_out", round(float(t[high_idx]), 3), round(float(t[low_idx] + sample_interval_s), 3)))
 
-    # 片尾二次兜底：若最后窗口整体持续下降且末端进入暗场，则视为淡出
-    tail2_len = max(min_frames + 1, min(max_frames, n - 1))
-    if tail2_len >= 2:
-        s2 = n - tail2_len
-        e2 = n - 1
-        tail2_diff = diff[s2:e2]
-        if len(tail2_diff) > 0:
-            down_ratio2 = float(np.mean(tail2_diff <= (slope_thr * 0.15)))
-            delta2 = float(b_smooth[s2] - b_smooth[e2])
-            dur2 = float(t[e2] - t[s2]) + sample_interval_s
-            tail2_dark = float(np.min(b_smooth[max(s2, e2 - min_frames + 1): e2 + 1]))
-            tail2_contrast = float(np.min(c[max(s2, e2 - min_frames + 1): e2 + 1]))
-            if (
-                down_ratio2 >= 0.72
-                and delta2 >= (min_delta * 0.35)
-                and dur2 >= (min_duration * 0.25)
-                and dur2 <= (max_duration * 1.2)
-                and tail2_dark <= (dark_threshold + 28.0)
-                and tail2_contrast <= (contrast_dark_limit * 1.15)
-            ):
-                fades.append(
-                    FadeSegment(
-                        "fade_out",
-                        round(float(t[s2]), 3),
-                        round(float(t[e2] + sample_interval_s), 3),
-                    )
-                )
-
+    # 通用斜率扫描
     i = 0
     while i < len(diff):
         d0 = float(diff[i])
         if abs(d0) < slope_thr:
             i += 1
             continue
-
         sign = 1.0 if d0 > 0 else -1.0
         j = i
-        strong = 0
         while j < len(diff) and (j - i + 1) <= max_frames:
             dj = float(diff[j])
             if dj * sign < -slope_thr:
                 break
-            if dj * sign >= slope_thr * 0.6:
-                strong += 1
             j += 1
-
-        end_idx = j  # 对应 b_smooth[end_idx]
+        end_idx = j
         run_len = end_idx - i
         if run_len >= min_frames:
             delta = float(b_smooth[end_idx] - b_smooth[i])
-            duration = float(t[end_idx] - t[i]) + sample_interval_s
+            dur = float(t[end_idx] - t[i]) + sample_interval_s
             if sign > 0:
-                # fade in：要求起点暗、整体亮度上升
-                if (
-                    b_smooth[i] <= dark_threshold
-                    and c[i] <= contrast_dark_limit
-                    and delta >= min_delta
-                    and duration <= max_duration
-                ):
+                if b_smooth[i] <= dark_threshold and c[i] <= contrast_dark_limit and delta >= min_delta and dur <= max_duration:
                     fades.append(FadeSegment("fade_in", round(float(t[i]), 3), round(float(t[end_idx] + sample_interval_s), 3)))
             else:
-                # fade out：要求终点暗、整体亮度下降
-                if (
-                    b_smooth[end_idx] <= dark_threshold
-                    and c[end_idx] <= contrast_dark_limit
-                    and (-delta) >= min_delta
-                    and duration <= max_duration
-                ):
+                if b_smooth[end_idx] <= dark_threshold and c[end_idx] <= contrast_dark_limit and (-delta) >= min_delta and dur <= max_duration:
                     fades.append(FadeSegment("fade_out", round(float(t[i]), 3), round(float(t[end_idx] + sample_interval_s), 3)))
-
         i = max(i + 1, end_idx)
 
-    # 合并同类型且间隔很短的段，降低碎片化
     if not fades:
         return fades
     fades.sort(key=lambda x: (x.start_s, x.end_s))
@@ -487,26 +450,20 @@ def detect_fade_segments(
     return merged
 
 
-def iter_ffmpeg_sampled_frames(
-    video_path: Path,
-    width: int,
-    height: int,
-    sample_fps: float,
-) -> Iterable[np.ndarray]:
-    frame_bytes = width * height * 3
+def iter_ffmpeg_sampled_frames(video_path: Path, width: int, height: int, sample_fps: float, gray: bool = False) -> Iterable[np.ndarray]:
+    if gray:
+        frame_bytes = width * height
+        pix = "gray"
+    else:
+        frame_bytes = width * height * 3
+        pix = "bgr24"
+
     vf = f"fps={sample_fps:.6f}"
     cmd = [
-        "ffmpeg",
-        "-v",
-        "error",
-        "-i",
-        str(video_path),
-        "-vf",
-        vf,
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "bgr24",
+        "ffmpeg", "-v", "error", "-i", str(video_path),
+        "-vf", vf,
+        "-f", "rawvideo",
+        "-pix_fmt", pix,
         "-",
     ]
 
@@ -517,7 +474,11 @@ def iter_ffmpeg_sampled_frames(
             raw = proc.stdout.read(frame_bytes)
             if not raw or len(raw) < frame_bytes:
                 break
-            yield np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+            arr = np.frombuffer(raw, dtype=np.uint8)
+            if gray:
+                yield arr.reshape((height, width))
+            else:
+                yield arr.reshape((height, width, 3))
     finally:
         if proc.stdout is not None:
             proc.stdout.close()
@@ -530,13 +491,7 @@ def iter_ffmpeg_sampled_frames(
             raise RuntimeError(f"ffmpeg failed for {video_path.name}: {stderr_text}")
 
 
-def collect_fade_brightness(
-    video_path: Path,
-    src_w: int,
-    src_h: int,
-    fade_sample_fps: float,
-    fade_scale_width: int,
-) -> Tuple[List[float], List[float], List[float]]:
+def collect_fade_brightness(video_path: Path, src_w: int, src_h: int, fade_sample_fps: float, fade_scale_width: int) -> Tuple[List[float], List[float], List[float]]:
     w = max(32, int(fade_scale_width))
     h = max(2, int(round(src_h * w / max(src_w, 1))))
     if h % 2 == 1:
@@ -545,17 +500,10 @@ def collect_fade_brightness(
     frame_bytes = w * h
     vf = f"fps={fade_sample_fps:.6f},scale={w}:{h},format=gray"
     cmd = [
-        "ffmpeg",
-        "-v",
-        "error",
-        "-i",
-        str(video_path),
-        "-vf",
-        vf,
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "gray",
+        "ffmpeg", "-v", "error", "-i", str(video_path),
+        "-vf", vf,
+        "-f", "rawvideo",
+        "-pix_fmt", "gray",
         "-",
     ]
 
@@ -594,6 +542,8 @@ def process_video(
     video_path: Path,
     score_threshold: float,
     sample_fps: float,
+    subtitle_min_hit_frames: int,
+    region_min_area_ratio: float,
     lang: str,
     use_textline_orientation: bool,
     fade_dark_threshold: float,
@@ -602,50 +552,50 @@ def process_video(
     fade_max_duration: float,
     fade_sample_fps: float,
     fade_scale_width: int,
-) -> VideoSubtitleResult:
+) -> VideoResult:
     try:
         fps, total_frames, duration_s, width, height = ffprobe_video_meta(video_path)
     except Exception as exc:
-        return VideoSubtitleResult(video_path.name, str(video_path), 0.0, 0, 0.0, False, [], False, [], f"ffprobe_error:{exc}")
+        return VideoResult(video_path.name, str(video_path), 0.0, 0, 0.0, False, False, False, [], False, [], f"ffprobe_error:{exc}")
 
     if width <= 0 or height <= 0:
-        return VideoSubtitleResult(
-            video_path.name,
-            str(video_path),
-            round(fps, 4),
-            total_frames,
-            round(duration_s, 3),
-            False,
-            [],
-            False,
-            [],
-            "invalid_resolution",
-        )
+        return VideoResult(video_path.name, str(video_path), round(fps, 4), total_frames, round(duration_s, 3), False, False, False, [], False, [], "invalid_resolution")
 
-    sample_times_s: List[float] = []
-    sample_hits: List[bool] = []
     sample_interval_s = 1.0 / max(sample_fps, 1e-6)
-    first_ocr_error = ""
+    sample_times_s: List[float] = []
+    ocr_hits: List[bool] = []
+    region_hits: List[bool] = []
+    first_error = ""
 
-    sample_index = 0
+    sample_idx = 0
     try:
-        for frame in iter_ffmpeg_sampled_frames(video_path, width, height, sample_fps=sample_fps):
+        for frame in iter_ffmpeg_sampled_frames(video_path, width, height, sample_fps=sample_fps, gray=False):
             try:
-                hit = ocr_frame_hit(frame, score_threshold, lang, use_textline_orientation)
+                o_hit, r_hit = subtitle_dual_channel_hit(
+                    frame,
+                    score_threshold=score_threshold,
+                    region_min_area_ratio=region_min_area_ratio,
+                    lang=lang,
+                    use_textline_orientation=use_textline_orientation,
+                )
             except Exception as exc:
-                if not first_ocr_error:
-                    first_ocr_error = f"ocr_error:{exc}"
-                hit = False
-            sample_times_s.append(sample_index * sample_interval_s)
-            sample_hits.append(hit)
-            sample_index += 1
+                if not first_error:
+                    first_error = f"ocr_error:{exc}"
+                o_hit, r_hit = False, False
+
+            sample_times_s.append(sample_idx * sample_interval_s)
+            ocr_hits.append(o_hit)
+            region_hits.append(r_hit)
+            sample_idx += 1
     except Exception as exc:
-        return VideoSubtitleResult(
+        return VideoResult(
             video_path.name,
             str(video_path),
             round(fps, 4),
             total_frames,
             round(duration_s, 3),
+            False,
+            False,
             False,
             [],
             False,
@@ -653,21 +603,27 @@ def process_video(
             f"ffmpeg_pipe_error:{exc}",
         )
 
-    subtitle_segments = detect_subtitle_segments(sample_times_s, sample_hits, sample_interval_s)
+    # 连续帧约束（误检抑制）
+    ocr_hits = keep_only_long_true_runs(ocr_hits, max(1, subtitle_min_hit_frames))
+    region_hits = keep_only_long_true_runs(region_hits, max(1, subtitle_min_hit_frames))
+    subtitle_hits = [a or b for a, b in zip(ocr_hits, region_hits)]
+
+    subtitle_segments = detect_subtitle_segments(
+        sample_times_s,
+        subtitle_hits,
+        sample_interval_s,
+    )
+
     fade_times: List[float] = []
     fade_brightness: List[float] = []
     fade_contrast: List[float] = []
     try:
         fade_times, fade_brightness, fade_contrast = collect_fade_brightness(
-            video_path=video_path,
-            src_w=width,
-            src_h=height,
-            fade_sample_fps=fade_sample_fps,
-            fade_scale_width=fade_scale_width,
+            video_path, width, height, fade_sample_fps=fade_sample_fps, fade_scale_width=fade_scale_width
         )
     except Exception as exc:
-        if not first_ocr_error:
-            first_ocr_error = f"fade_error:{exc}"
+        if not first_error:
+            first_error = f"fade_error:{exc}"
 
     fade_segments = detect_fade_segments(
         sample_times_s=fade_times,
@@ -680,27 +636,31 @@ def process_video(
         max_duration=fade_max_duration,
     )
 
-    return VideoSubtitleResult(
+    return VideoResult(
         video_name=video_path.name,
         video_path=str(video_path),
         fps=round(fps, 4),
         total_frames=total_frames,
         duration_s=round(duration_s, 3),
         has_subtitle=bool(subtitle_segments),
+        has_subtitle_ocr=any(ocr_hits),
+        has_subtitle_region=any(region_hits),
         subtitle_segments=subtitle_segments,
         has_fade=bool(fade_segments),
         fade_segments=fade_segments,
-        error=first_ocr_error,
+        error=first_error,
     )
 
 
 def process_video_task(
-    task: Tuple[Path, float, float, str, bool, float, float, float, float, float, int]
-) -> Tuple[Path, VideoSubtitleResult]:
+    task: Tuple[Path, float, float, int, float, str, bool, float, float, float, float, float, int]
+) -> Tuple[Path, VideoResult]:
     (
         vp,
         score_threshold,
         sample_fps,
+        subtitle_min_hit_frames,
+        region_min_area_ratio,
         lang,
         use_textline_orientation,
         fade_dark_threshold,
@@ -710,18 +670,21 @@ def process_video_task(
         fade_sample_fps,
         fade_scale_width,
     ) = task
+
     return vp, process_video(
-        vp,
-        score_threshold,
-        sample_fps,
-        lang,
-        use_textline_orientation,
-        fade_dark_threshold,
-        fade_min_delta,
-        fade_min_duration,
-        fade_max_duration,
-        fade_sample_fps,
-        fade_scale_width,
+        video_path=vp,
+        score_threshold=score_threshold,
+        sample_fps=sample_fps,
+        subtitle_min_hit_frames=subtitle_min_hit_frames,
+        region_min_area_ratio=region_min_area_ratio,
+        lang=lang,
+        use_textline_orientation=use_textline_orientation,
+        fade_dark_threshold=fade_dark_threshold,
+        fade_min_delta=fade_min_delta,
+        fade_min_duration=fade_min_duration,
+        fade_max_duration=fade_max_duration,
+        fade_sample_fps=fade_sample_fps,
+        fade_scale_width=fade_scale_width,
     )
 
 
@@ -743,6 +706,8 @@ def main() -> None:
             vp,
             float(args.score_threshold),
             sample_fps,
+            int(args.subtitle_min_hit_frames),
+            float(args.region_min_area_ratio),
             str(args.lang),
             not bool(args.no_angle_cls),
             float(args.fade_dark_threshold),
@@ -757,15 +722,14 @@ def main() -> None:
 
     print(f"[INFO] total videos={len(videos)} workers={worker_count} sample_fps={sample_fps}")
 
-    results_map: Dict[Path, VideoSubtitleResult] = {}
+    results_map: Dict[Path, VideoResult] = {}
     if worker_count == 1:
         for t in tasks:
-            vp, result = process_video_task(t)
-            results_map[vp] = result
+            vp, r = process_video_task(t)
+            results_map[vp] = r
             print(
-                f"[DONE] {vp.name} has_subtitle={result.has_subtitle} "
-                f"sub_segments={len(result.subtitle_segments)} has_fade={result.has_fade} "
-                f"fade_segments={len(result.fade_segments)} err={result.error}"
+                f"[DONE] {vp.name} sub={r.has_subtitle}(ocr={r.has_subtitle_ocr},region={r.has_subtitle_region}) "
+                f"sub_segments={len(r.subtitle_segments)} fade={r.has_fade} fade_segments={len(r.fade_segments)} err={r.error}"
             )
     else:
         with ProcessPoolExecutor(max_workers=worker_count) as executor:
@@ -773,27 +737,33 @@ def main() -> None:
             for future in as_completed(future_map):
                 vp = future_map[future]
                 try:
-                    _, result = future.result()
+                    _, r = future.result()
                 except Exception as exc:
-                    result = VideoSubtitleResult(vp.name, str(vp), 0.0, 0, 0.0, False, [], False, [], f"worker_error:{exc}")
-                results_map[vp] = result
+                    r = VideoResult(vp.name, str(vp), 0.0, 0, 0.0, False, False, False, [], False, [], f"worker_error:{exc}")
+                results_map[vp] = r
                 print(
-                    f"[DONE] {vp.name} has_subtitle={result.has_subtitle} "
-                    f"sub_segments={len(result.subtitle_segments)} has_fade={result.has_fade} "
-                    f"fade_segments={len(result.fade_segments)} err={result.error}"
+                    f"[DONE] {vp.name} sub={r.has_subtitle}(ocr={r.has_subtitle_ocr},region={r.has_subtitle_region}) "
+                    f"sub_segments={len(r.subtitle_segments)} fade={r.has_fade} fade_segments={len(r.fade_segments)} err={r.error}"
                 )
 
-    ordered_results: List[Dict[str, Any]] = []
-    has_subtitle_count = 0
-    has_fade_count = 0
+    ordered: List[Dict[str, Any]] = []
+    sub_cnt = 0
+    sub_ocr_cnt = 0
+    sub_region_cnt = 0
+    fade_cnt = 0
+
     for vp in sorted(videos, key=lambda x: str(x)):
         r = results_map[vp]
         if r.has_subtitle:
-            has_subtitle_count += 1
+            sub_cnt += 1
+        if r.has_subtitle_ocr:
+            sub_ocr_cnt += 1
+        if r.has_subtitle_region:
+            sub_region_cnt += 1
         if r.has_fade:
-            has_fade_count += 1
+            fade_cnt += 1
 
-        ordered_results.append(
+        ordered.append(
             {
                 "video_name": r.video_name,
                 "video_path": r.video_path,
@@ -801,25 +771,27 @@ def main() -> None:
                 "total_frames": r.total_frames,
                 "duration_s": r.duration_s,
                 "has_subtitle": r.has_subtitle,
+                "has_subtitle_ocr": r.has_subtitle_ocr,
+                "has_subtitle_region": r.has_subtitle_region,
                 "subtitle_segments": [
                     {
-                        "start_s": seg.start_s,
-                        "end_s": seg.end_s,
-                        "start_hhmmss": format_hhmmss(seg.start_s),
-                        "end_hhmmss": format_hhmmss(seg.end_s),
+                        "start_s": s.start_s,
+                        "end_s": s.end_s,
+                        "start_hhmmss": format_hhmmss(s.start_s),
+                        "end_hhmmss": format_hhmmss(s.end_s),
                     }
-                    for seg in r.subtitle_segments
+                    for s in r.subtitle_segments
                 ],
                 "has_fade": r.has_fade,
                 "fade_segments": [
                     {
-                        "fade_type": seg.fade_type,
-                        "start_s": seg.start_s,
-                        "end_s": seg.end_s,
-                        "start_hhmmss": format_hhmmss(seg.start_s),
-                        "end_hhmmss": format_hhmmss(seg.end_s),
+                        "fade_type": f.fade_type,
+                        "start_s": f.start_s,
+                        "end_s": f.end_s,
+                        "start_hhmmss": format_hhmmss(f.start_s),
+                        "end_hhmmss": format_hhmmss(f.end_s),
                     }
-                    for seg in r.fade_segments
+                    for f in r.fade_segments
                 ],
                 "error": r.error,
             }
@@ -833,6 +805,9 @@ def main() -> None:
             "sample_fps": sample_fps,
             "crop_region": "full_frame",
             "score_threshold": float(args.score_threshold),
+            "subtitle_min_hit_frames": int(args.subtitle_min_hit_frames),
+            "region_min_area_ratio": float(args.region_min_area_ratio),
+            "subtitle_detector": "dual_channel(ocr_score + text_region)",
             "ocr": "PP-OCRv4 (PaddleOCR)",
             "decoder": "ffmpeg",
             "fade_dark_threshold": float(args.fade_dark_threshold),
@@ -844,11 +819,13 @@ def main() -> None:
         },
         "summary": {
             "total_videos": len(videos),
-            "has_subtitle_videos": has_subtitle_count,
-            "no_subtitle_videos": len(videos) - has_subtitle_count,
-            "has_fade_videos": has_fade_count,
+            "has_subtitle_videos": sub_cnt,
+            "has_subtitle_ocr_videos": sub_ocr_cnt,
+            "has_subtitle_region_videos": sub_region_cnt,
+            "no_subtitle_videos": len(videos) - sub_cnt,
+            "has_fade_videos": fade_cnt,
         },
-        "videos": ordered_results,
+        "videos": ordered,
     }
 
     json_path = args.json_path
