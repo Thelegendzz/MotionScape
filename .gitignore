@@ -1,2 +1,8 @@
 .env
 output/
+video/
+prompt_action_simple.txt
+prompt_action_v2.txt
+prompt_action.txt
+prompt_v1.txt
+prompt_v2.txt

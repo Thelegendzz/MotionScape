@@ -1,0 +1,84 @@
+{
+  "videos": 
+    [
+        {"video_name":"OPENAIR SAFIENTAL 2022 — Cinematic FPV.mp4",
+            "ambiguous_timestamps_s": [[0.0,2.5]],
+            "relevant_timestamps_s":[[2.5,54]],
+            "bad_timestamps_s": [[54.0,61.0]]
+        },
+        {"video_name":"NIGHTHAWK PRO 280 VS APPLE TREE.mp4",
+            "bad_timestamps_s": [],
+            "relevant_timestamps_s":[[9.0,110.0]],
+            "ambiguous_timestamps_s": [[0.0,9.0],[110.0,120.0]] 
+        },
+        {"video_name":"Slushy.mp4",
+            "bad_timestamps_s": [],
+            "relevant_timestamps_s":[[0.0,154.0]],
+            "ambiguous_timestamps_s": []
+        },
+        {"video_name":"Huge Abandoned Hotel in Korea.mp4",
+            "relevant_timestamps_s":[[0.0,145.0]],
+            "bad_timestamps_s": [[145.0,158.0]],
+            "ambiguous_timestamps_s": []
+        },
+        {"video_name":"GO LOW AND FAST - UNTIL THE LIPO DIES.mp4",
+            "bad_timestamps_s": [[0.0,5.0],[165.0,169.5]],
+            "relevant_timestamps_s":[[5.0,158.0]],
+            "ambiguous_timestamps_s": [[158.0,165.0]]
+        },
+        {"video_name":"Hot Air Balloon X FPV – Flying Over an Ocean of Clouds with an FPV Drone.mp4",
+            "bad_timestamps_s":[],
+            "relevant_timestamps_s":[[0.0,97.0]],
+            "ambiguous_timestamps_s": [[97.0,100.0]]
+        },
+        {"video_name":"Stromboli Volcano ｜ FPV drone flight through erupting lava.mp4",
+            "relevant_timestamps_s":[[0.0,149.0]],
+            "bad_timestamps_s": [[149.0,150.5]],
+            "ambiguous_timestamps_s": []
+        },
+        {   "video_name":"Get juicy or explode trying.mp4",
+            "ambiguous_timestamps_s": [[0.0,5.5]],
+            "bad_timestamps_s": [[5.5,11.0],[140.0,150.0]],
+            "relevant_timestamps_s":[[11.0,140.0]]
+        },
+        {"video_name":"UGANDA from Above ｜ African Wildlife with an FPV drone.mp4",
+            "relevant_timestamps_s":[[0.0,176.0]],
+            "bad_timestamps_s": [[176.0,180.5]],
+            "ambiguous_timestamps_s": []
+        },
+        {"video_name":"Croatia Like Never Before： Cinematic FPV Drone Footage.mp4",
+            "relevant_timestamps_s":[[0.0,156.0],[157.5,163.0],[167.0,171.0],[177.0,186.5]],
+            "bad_timestamps_s": [[156.0,157.5],[163.0,167.0],[171.0,177.0],[186.5,201.5]],
+            "ambiguous_timestamps_s": []
+        },
+        {"video_name":"SANDSCAPE - Johnny FPV.mp4",
+            "ambiguous_timestamps_s": [[0.0,1.0]],
+            "bad_timestamps_s": [[1.0,4.0],[14.0,17.5],[138.5,148.5]],
+            "relevant_timestamps_s":[[4.0,14.0],[17.5,138.5]]
+        },
+        // {"video_name":"Into the Crater ｜ 5K Cinematic FPV Film ｜ 2023 Iceland Volcanic Eruption.mp4",
+        //     "bad_timestamps_s": [],
+        //     "relevant_timestamps_s":[[0.0,159.0]],
+        //     "ambiguous_timestamps_s": []
+        // },
+        {"video_name":"NEW Lumenier QAV-S 2 JohnnyFPV Frame - BELIZE FPV.mp4",
+            "bad_timestamps_s": [[0.0,64.0],[204.5,206.0]],
+            "relevant_timestamps_s":[[64.0,204.5]],
+            "ambiguous_timestamps_s": []
+        },
+        {"video_name":"DRIFT v2 - Johnny FPV.mp4",
+            "bad_timestamps_s": [[94.0,220.5]],
+            "relevant_timestamps_s":[[0.0,94.0]],
+            "ambiguous_timestamps_s": []
+        },
+        {"video_name":"I have an addiction.  (CINEMATIC DRONE RACING) (PARIS 2017).mp4",
+            "bad_timestamps_s": [[0.0,4.0],[20.0,51.5],[218.0,231.5]],
+            "ambiguous_timestamps_s": [[4.0,20.0],[182.0,218.0]],
+            "relevant_timestamps_s":[[51.5,182.0]]
+        }
+    ]
+}
+
+
+
+

@@ -28,7 +28,7 @@ Regarding maneuver timing: Please identify the maneuver and its approximate acti
 - Unknown: Cannot be determined due to extreme blur, occlusion, or lack of features.
   
 [Weather Categories]
-- Sunny / Overcast / Fog/Haze / Night / Indoor / Unknown
+- Sunny / Overcast / rainy / snowy / Fog/Haze / Night / Indoor / Unknown
   
 Please output the result in STRICT JSON format with the following keys:
 {
