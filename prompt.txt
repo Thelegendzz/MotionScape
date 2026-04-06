@@ -1,0 +1,13 @@
+You are provided RGB image frame.
+Analyze the weather, environment, drone maneuver, and provide a detailed video caption.
+
+TASK: SCENE ANALYSIS
+[Weather Categories]
+- Sunny / Overcast / Rainy / Snowy / Fog/Haze / Night / Indoor / Unknown
+  
+Please output the result in STRICT JSON format with the following keys:
+{
+  "weather": "Select from Weather Categories (or 'N/A' if false)",
+  "environment": "Brief description of the scene, max 5 words (or 'N/A')",
+  "caption": "Write a detailed 2-3 sentence objective caption of the target video segment for controllable video generation. The first sentence should describe the scene type, environmental layout, lighting, and weather conditions. The remaining sentences should describe the drone camera motion in a precise and structured way. The motion description must explicitly specify the flight direction, trajectory, motion speed or speed change, camera rotation direction and type, viewpoint changes, and, when relevant, the drone's relative motion with respect to the surrounding terrain or scene structure (e.g., maintaining altitude over descending terrain, moving through dense trees, or revealing a wider landscape). Use concrete motion terms such as forward motion, left turn, right turn, ascent, descent, yaw, pitch, tilt, acceleration, deceleration, and viewpoint expansion when appropriate. Keep the description factual, concise, and motion-oriented. Do not use subjective, emotional, aesthetic, or cinematic language such as 'beautiful', 'serene', 'dramatic', 'graceful', or 'evoking'. (or 'N/A')"
+}

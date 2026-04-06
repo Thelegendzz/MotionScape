@@ -1,0 +1,7 @@
+paddlepaddle==2.6.2
+paddleocr==2.8.1
+# 【核心修复】必须锁死 numpy 小于 2.0.0，否则 Paddle 必炸！
+numpy<2.0.0
+# 推荐锁死一个稳定的 opencv 版本
+opencv-python-headless==4.9.0.80
+python-dotenv==1.0.1
