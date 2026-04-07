@@ -30,7 +30,6 @@ This dataset is intended for academic research use only. Users must comply with 
 
 Supplementary materials associated with the paper are available on this page, including:
 - additional visualizations
-- benchmark details
 - example videos
 - supplementary document
 
