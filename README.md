@@ -2,10 +2,7 @@
 
 > A Large-Scale Real-World Highly Dynamic UAV Video Dataset for World Models.
 
-[[Project Page]]()
-[[Paper]]()
 [[Dataset Access]](https://drive.google.com/drive/folders/1ssPQ9bdGkPsGa_yRywglh_omH2D4pEG6)
-[[Supplementary Materials]]()
 
 ---
 ## Overview
@@ -26,10 +23,4 @@ More details about the release format, download instructions, and usage policy w
 
 This dataset is intended for academic research use only. Users must comply with the corresponding usage terms and citation requirements. Detailed license information will be provided here.
 
-## Supplementary Materials
-
-Supplementary materials associated with the paper are available on this page, including:
-- additional visualizations
-- example videos
-- supplementary document
 
