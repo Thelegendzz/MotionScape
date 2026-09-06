@@ -1,0 +1,15 @@
+.git
+.env
+archive_unused
+__pycache__
+*.pyc
+*.log
+.cache
+.venv*
+output
+video
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm

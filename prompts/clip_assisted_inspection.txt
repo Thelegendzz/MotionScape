@@ -1,0 +1,23 @@
+subtitle_text:
+A video frame with overlaid subtitles or captions
+A frame with embedded text overlay on the scene
+A video scene containing visible subtitle or caption text
+A real video frame with added text overlay
+
+title_logo_intro:
+A title screen or intro card with logo and text
+A branded outro screen with graphics and text
+A full-screen logo or sponsor graphic
+A full-frame title card or end screen
+
+transition_effect:
+A black or nearly blank transition frame
+A fade-in or fade-out transition frame
+An animated transition effect between scenes
+A visual transition frame rather than actual scene content
+
+third_person_drone:
+A video frame showing a drone from an external view
+A third-person shot where the drone is visible in the scene
+A video frame showing the body of a drone
+A shot displaying or introducing a drone

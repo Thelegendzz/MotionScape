@@ -1,0 +1,7 @@
+{
+  "inference_type": "video2world",
+  "name": "MotionScape-Cosmos-Predict2.5-2B-V2W",
+  "input_path": "/dataset/MotionScape/first_200_videos",
+  "num_output_frames": 77,
+  "prompt_path": "v2w_clip_level.txt"
+}

@@ -1,0 +1,4 @@
+Given an objective description of a future target segment, generate a plausible first-person onboard-camera video. Maintain consistency with the described scene layout, appearance, lighting, geometry, and camera-viewpoint motion, with smooth and realistic temporal progression.
+
+Future target description:
+{clip_text_annotation}

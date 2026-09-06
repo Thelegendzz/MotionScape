@@ -1,0 +1,4 @@
+You are given a textual description of the future frames from a dynamic UAV-view scene. Your task is to generate the future video frames that best match the provided description. The generated video should depict the described scene, environment, weather, and motion as faithfully as possible, with coherent camera dynamics, stable temporal progression, and consistent scene geometry. The motion should evolve smoothly over time and remain plausible for a UAV-view video. Avoid abrupt viewpoint changes, sudden motion-scale shifts, unrealistic acceleration or deceleration, inconsistent scene layout, and temporal blur.
+
+The future frames are described as follows:
+{clip_text_annotation}
