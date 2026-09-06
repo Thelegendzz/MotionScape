@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  motionscape-runtime list
+  motionscape-runtime MODEL COMMAND [ARG...]
+
+MODEL:
+  cosmos       Cosmos-Predict2.5-2B (Python 3.10.18, torch 2.7.1+cu128)
+  cogvideox    CogVideoX1.5-5B/I2V (Python 3.10.12, torch 2.8.0+cu128)
+  wan22        Wan2.2 T2V/I2V (Python 3.10.12, torch 2.8.0+cu128)
+  longcat      LongCat-Video (Python 3.10.12, torch 2.8.0+cu128)
+  magi1        MAGI-1-24B (Python 3.10.20, torch 2.11.0+cu130)
+
+Examples:
+  motionscape-runtime cosmos python3 -c 'import torch; print(torch.__version__)'
+  motionscape-runtime wan22 python3 /workspace/MotionScape/inference/wan/i2v.py --help
+USAGE
+}
+
+if [[ $# -eq 0 || "${1:-}" == "help" || "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+if [[ "${1:-}" == "list" ]]; then
+  printf '%s\n' cosmos cogvideox wan22 longcat magi1
+  exit 0
+fi
+
+model="$1"
+shift
+if [[ $# -eq 0 ]]; then
+  echo "No command supplied for model: $model" >&2
+  usage >&2
+  exit 2
+fi
+
+base_ld="/usr/local/cuda/lib64"
+extra_source="${MOTIONSCAPE_MODEL_SOURCE:-}"
+
+case "$model" in
+  cosmos|cosmos-predict2.5)
+    export PATH="/workspace/.venv/bin:/opt/python310/python/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+    export VIRTUAL_ENV="/workspace/.venv"
+    export PYTHONPATH="${extra_source:+$extra_source:}/workspace${PYTHONPATH:+:$PYTHONPATH}"
+    export LD_LIBRARY_PATH="$base_ld${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    ;;
+  cog|cogvideo|cogvideox|cogvideox1.5)
+    export PATH="/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+    export PYTHONPATH="${extra_source:+$extra_source:}${PYTHONPATH:-}"
+    export LD_LIBRARY_PATH="$base_ld${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    ;;
+  wan|wan22|wan2.2)
+    export PATH="/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+    export PYTHONPATH="${extra_source:+$extra_source:}/opt/motionscape/envs/wan22/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+    export LD_LIBRARY_PATH="$base_ld${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    ;;
+  longcat|longcat-video)
+    export PATH="/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin"
+    export PYTHONPATH="${extra_source:+$extra_source:}/opt/motionscape/envs/longcat/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+    export LD_LIBRARY_PATH="$base_ld${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    ;;
+  magi|magi1|magi-1)
+    magi_env="/opt/motionscape/envs/magi1"
+    export MAGI_ENV="$magi_env"
+    export CUDA_HOME="$magi_env/targets/x86_64-linux"
+    export PATH="$magi_env/bin:$magi_env/nvvm/bin:/usr/local/bin:/usr/bin:/bin"
+    export PYTHONPATH="${extra_source:+$extra_source:}${MAGI_ROOT:-/workspace/MAGI-1}${PYTHONPATH:+:$PYTHONPATH}"
+    export CPATH="$magi_env/targets/x86_64-linux/include:$magi_env/targets/x86_64-linux/include/cccl${CPATH:+:$CPATH}"
+    export LD_LIBRARY_PATH="$magi_env/lib:$magi_env/targets/x86_64-linux/lib:$base_ld${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    ;;
+  *)
+    echo "Unknown model runtime: $model" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+exec "$@"

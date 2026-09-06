@@ -1,0 +1,4 @@
+Given observed first-person onboard-camera video frames and an objective description of the future target segment, generate a plausible future continuation. Preserve scene layout, appearance, lighting, and geometry, and continue the camera viewpoint motion smoothly and consistently with the observations and description.
+
+Future target description:
+{clip_text_annotation}

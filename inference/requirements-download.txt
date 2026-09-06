@@ -1,0 +1,4 @@
+# Weight-download utility only. This version matches the recorded
+# Cosmos-Predict2.5 experiment Docker environment; it is not a replacement
+# for any model-specific inference environment.
+huggingface-hub==0.36.0

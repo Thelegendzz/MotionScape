@@ -1,0 +1,4 @@
+Given an observed first-person onboard-camera image and an objective description of the future target segment, generate a plausible future video. Preserve scene layout, appearance, lighting, viewpoint, and geometry, and follow the described camera-viewpoint motion smoothly.
+
+Future target description:
+{clip_text_annotation}

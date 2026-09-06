@@ -1,0 +1,7 @@
+{
+  "inference_type": "video2world",
+  "name": "cosmos_v2w_task",
+  "input_path": "/dataset/MotionScape/first_200_videos",
+  "num_output_frames": 77,
+  "prompt_path": "v2w_task_level.txt"
+}

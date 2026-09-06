@@ -1,0 +1,4 @@
+You are given the observed video frames of a dynamic scene and a textual description of the future frames. Your task is to generate the future video frames that most plausibly follow the observations while matching the provided future-frame description. The predicted motion should continue smoothly from the observed frames, with consistent speed, coherent camera dynamics, and stable temporal progression. Avoid abrupt changes in motion scale, sudden acceleration or deceleration, and temporal blur.
+
+The future frames are described as follows:
+{clip_text_annotation}

@@ -1,0 +1,1 @@
+Given observed first-person onboard-camera video frames, generate a plausible future continuation. Infer the future scene evolution and camera-viewpoint motion solely from the observed video context. Preserve scene layout, appearance, lighting, and geometry, and continue the camera viewpoint motion smoothly and consistently with the observations.

@@ -1,0 +1,7 @@
+{
+  "inference_type": "image2world",
+  "name": "MotionScape-Cosmos-Predict2.5-2B-I2W",
+  "input_path": "/dataset/MotionScape/full_frames",
+  "num_output_frames": 77,
+  "prompt_path": "i2w_clip_level.txt"
+}

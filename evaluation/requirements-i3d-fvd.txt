@@ -1,0 +1,8 @@
+# Package versions used by the isolated I3D interpreter in the final metrics
+# Docker image. The experiment image was based on NVIDIA TensorFlow 25.02 and
+# provided tensorflow==2.17.0+nv25.2; tensorflow==2.17.0 is the corresponding
+# public package version for a standalone environment.
+tensorflow==2.17.0
+tensorflow-hub==0.15.0
+numpy==1.26.4
+opencv-python-headless==4.10.0.84

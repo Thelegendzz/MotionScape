@@ -1,0 +1,27 @@
+You are provided with multiple RGB frames sampled from a video captured by a
+first-person onboard camera. The sample contains an observed prefix followed
+by a future target segment. Analyze the weather, environment, future scene
+evolution, and first-person camera-viewpoint motion, and provide a detailed
+video caption.
+
+The first 5 frames are conditioning context frames from the observed prefix,
+and the remaining frames are sampled from the future target segment. Use the
+first 5 conditioning frames only as temporal context to identify the starting
+scene layout and camera viewpoint of the future target segment. Do not describe
+visual events that occur only in the conditioning frames. Base the motion
+description only on visible changes in the subsequent future frames, rather
+than extrapolation from the conditioning frames. The caption must describe
+only the future target segment.
+
+TASK: SCENE AND CAMERA-MOTION ANALYSIS
+
+[Weather Categories]
+- Sunny / Overcast / Rainy / Snowy / Fog/Haze / Night / Unknown
+
+Please output the result in STRICT JSON format with the following keys:
+
+{
+  "weather": "Select from Weather Categories",
+  "environment": "Brief description of the scene, max 5 words (or 'N/A')",
+  "caption": "Write a detailed 2-3 sentence objective caption of the future target segment for controllable video generation. The first sentence should describe the scene type, environmental layout, lighting, weather conditions, and relevant visible objects. The remaining sentences should describe the motion of the first-person camera viewpoint in a precise and structured way. Explicitly describe the movement direction, trajectory, motion speed or speed change, camera rotation direction and type, viewpoint changes, and, when relevant, the camera viewpoint's relative motion with respect to the surrounding terrain or scene structure, such as maintaining a nearly constant height over descending terrain, moving through dense trees, or revealing a wider landscape. Use 'the camera viewpoint' or 'the onboard camera' as the grammatical subject of motion descriptions. Do not describe the camera carrier as a visible object unless it is actually visible in the frames. Use concrete motion terms such as forward motion, lateral movement, left turn, right turn, ascent, descent, yaw, pitch, roll, tilt, acceleration, deceleration, and viewpoint expansion when directly supported by the frames. Keep the description factual, concise, and motion-oriented. Do not use subjective, emotional, aesthetic, or cinematic language."
+}

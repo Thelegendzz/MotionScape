@@ -1,0 +1,7 @@
+{
+  "inference_type": "text2world",
+  "name": "MotionScape-Cosmos-Predict2.5-2B-T2W",
+  "input_path": "/dataset/MotionScape/annotations/v2",
+  "num_output_frames": 77,
+  "prompt_path": "t2w_clip_level.txt"
+}

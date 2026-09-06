@@ -1,0 +1,906 @@
+diff --git a/cosmos_predict2/_src/predict2/inference/video2world.py b/cosmos_predict2/_src/predict2/inference/video2world.py
+index ecd6c8f..a36b340 100644
+--- a/cosmos_predict2/_src/predict2/inference/video2world.py
++++ b/cosmos_predict2/_src/predict2/inference/video2world.py
+@@ -51,10 +51,15 @@ input_root/
+  └── ...
+ """
+ 
++import collections
+ import math
+ import os
++from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
++import imageio
++import imageio.v3 as iio_v3
++import numpy as np
+ import torch
+ import torchvision
+ from megatron.core import parallel_state
+@@ -62,7 +67,6 @@ from PIL import Image
+ 
+ from cosmos_predict2._src.imaginaire.flags import INTERNAL
+ from cosmos_predict2._src.imaginaire.utils import distributed, log
+-from cosmos_predict2._src.imaginaire.utils.easy_io import easy_io
+ from cosmos_predict2._src.predict2.inference.get_t5_emb import get_text_embedding
+ from cosmos_predict2._src.predict2.utils.model_loader import load_model_from_checkpoint
+ 
+@@ -70,6 +74,8 @@ _IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"]
+ _VIDEO_EXTENSIONS = [".mp4"]
+ 
+ _DEFAULT_NEGATIVE_PROMPT = "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, jerky movements, low frame rate, artifacting, color banding, unnatural transitions, outdated special effects, fake elements, unconvincing visuals, poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of poor quality."
++_MAX_INPUT_VIDEO_HEIGHT = 1080
++_MAX_INPUT_VIDEO_WIDTH = 1920
+ 
+ 
+ def resize_input(video: torch.Tensor, resolution: list[int]):
+@@ -97,6 +103,57 @@ def resize_input(video: torch.Tensor, resolution: list[int]):
+     return video_cropped
+ 
+ 
++def _maybe_downscale_video_for_io(video: torch.Tensor) -> torch.Tensor:
++    """Pre-downscale oversized input videos before float conversion to cap host memory usage."""
++
++    orig_h, orig_w = video.shape[2], video.shape[3]
++    if orig_h <= _MAX_INPUT_VIDEO_HEIGHT and orig_w <= _MAX_INPUT_VIDEO_WIDTH:
++        return video
++
++    scaling_ratio = min(_MAX_INPUT_VIDEO_HEIGHT / orig_h, _MAX_INPUT_VIDEO_WIDTH / orig_w)
++    resized_h = max(1, int(math.floor(orig_h * scaling_ratio)))
++    resized_w = max(1, int(math.floor(orig_w * scaling_ratio)))
++    log.info(f"Downscaling input video from {orig_h}x{orig_w} to {resized_h}x{resized_w} before preprocessing")
++    return torchvision.transforms.functional.resize(video, [resized_h, resized_w], antialias=True)
++
++
++def _slice_video_frames(video_tensor: torch.Tensor, input_frame_start: int | None, input_frame_end: int | None) -> torch.Tensor:
++    """
++    Select a temporal segment from a video tensor in (C, T, H, W) format.
++
++    Args:
++        video_tensor: Input video tensor in (C, T, H, W) format.
++        input_frame_start: Inclusive start frame. Defaults to the start of the video.
++        input_frame_end: Exclusive end frame. Defaults to the end of the video.
++
++    Returns:
++        torch.Tensor: Sliced video tensor in (C, T, H, W) format.
++    """
++
++    available_frames = video_tensor.shape[1]
++    start_idx = 0 if input_frame_start is None else input_frame_start
++    end_idx = available_frames if input_frame_end is None else input_frame_end
++
++    if start_idx < 0:
++        raise ValueError(f"input_frame_start must be >= 0, but got {start_idx}")
++    if end_idx < 0:
++        raise ValueError(f"input_frame_end must be >= 0, but got {end_idx}")
++    if start_idx >= available_frames:
++        raise ValueError(
++            f"input_frame_start={start_idx} is out of range for a video with {available_frames} frames"
++        )
++    if end_idx > available_frames:
++        raise ValueError(f"input_frame_end={end_idx} exceeds the input video length of {available_frames} frames")
++    if end_idx <= start_idx:
++        raise ValueError(
++            f"Expected input_frame_end > input_frame_start, but got {input_frame_start=} and {input_frame_end=}"
++        )
++
++    sliced_video = video_tensor[:, start_idx:end_idx, :, :]
++    log.info(f"Selected input video segment [{start_idx}, {end_idx}) with {sliced_video.shape[1]} frames")
++    return sliced_video
++
++
+ def read_and_process_image(img_path: str, resolution: list[int], num_video_frames: int, resize: bool = True):
+     """
+     Reads an image, converts it to a video tensor, and processes it for model input.
+@@ -147,6 +204,10 @@ def read_and_process_video(
+     resolution: list[int],
+     num_video_frames: int,
+     num_latent_conditional_frames: int = 2,
++    input_frame_start: int | None = None,
++    input_frame_end: int | None = None,
++    save_input_clip_path: str | None = None,
++    save_gt_clip_path: str | None = None,
+     resize: bool = True,
+ ):
+     """
+@@ -161,6 +222,8 @@ def read_and_process_video(
+         resolution (list[int]): Target resolution [H, W] for resizing.
+         num_video_frames (int): Number of frames needed by the model (should equal model.tokenizer.get_pixel_num_frames(model.config.state_t)).
+         num_latent_conditional_frames (int): Number of latent conditional frames from the input video (1 or 2).
++        input_frame_start (int | None): Inclusive start frame of the input segment to use.
++        input_frame_end (int | None): Exclusive end frame of the input segment to use.
+         resize (bool, optional): Whether to resize the video to the target resolution. Defaults to True.
+ 
+     Returns:
+@@ -176,20 +239,17 @@ def read_and_process_video(
+     if ext.lower() not in _VIDEO_EXTENSIONS:
+         raise ValueError(f"Invalid video extension: {ext}")
+ 
+-    # Load video using easy_io
+-    try:
+-        video_frames, video_metadata = easy_io.load(video_path)  # Returns (T, H, W, C) numpy array
+-        log.info(f"Loaded video with shape {video_frames.shape}, metadata: {video_metadata}")
+-    except Exception as e:
+-        raise ValueError(f"Failed to load video {video_path}: {e}")
+-
+-    # Convert numpy array to tensor and rearrange dimensions
+-    video_tensor = torch.from_numpy(video_frames).float() / 255.0  # Convert to [0, 1] range
+-    video_tensor = video_tensor.permute(3, 0, 1, 2)  # (T, H, W, C) -> (C, T, H, W)
+-
+-    available_frames = video_tensor.shape[1]
++    # We only need the last few frames from the selected segment, so stream the video
++    # to avoid materializing the full 4K clip in memory.
++    start_idx = 0 if input_frame_start is None else input_frame_start
++    end_idx = input_frame_end
++    if start_idx < 0:
++        raise ValueError(f"input_frame_start must be >= 0, but got {start_idx}")
++    if end_idx is not None and end_idx < 0:
++        raise ValueError(f"input_frame_end must be >= 0, but got {end_idx}")
++    if end_idx is not None and end_idx <= start_idx:
++        raise ValueError(f"Expected input_frame_end > input_frame_start, but got {input_frame_start=} and {input_frame_end=}")
+ 
+-    # Calculate how many frames to extract from input video
+     frames_to_extract = 4 * (num_latent_conditional_frames - 1) + 1
+     log.info(f"Will extract {frames_to_extract} frames from input video and pad to {num_video_frames}")
+ 
+@@ -197,20 +257,93 @@ def read_and_process_video(
+     if num_latent_conditional_frames not in [1, 2]:
+         raise ValueError(f"num_latent_conditional_frames must be 1 or 2, but got {num_latent_conditional_frames}")
+ 
+-    # Create output tensor with exact num_video_frames
+-    C, _, H, W = video_tensor.shape
+-    full_video = torch.zeros(C, num_video_frames, H, W)
++    try:
++        video_metadata = iio_v3.immeta(video_path, plugin="pyav")
++        log.info(f"Loaded video metadata: {video_metadata}")
++    except Exception:
++        video_metadata = {}
+ 
+-    if available_frames < frames_to_extract:
++    try:
++        frame_iter = iio_v3.imiter(video_path, plugin="pyav")
++    except Exception as e:
++        raise ValueError(f"Failed to load video {video_path}: {e}")
++
++    selected_count = 0
++    tail_frames: collections.deque[np.ndarray] = collections.deque(maxlen=frames_to_extract)
++    gt_frames: collections.deque[np.ndarray] = collections.deque(maxlen=num_video_frames)
++    gt_start = None
++    gt_end = None
++    if save_gt_clip_path is not None:
++        if end_idx is None:
++            log.warning("save_gt_clip_path requires input_frame_end to align GT with generated window; skipping GT save.")
++        else:
++            gt_start = max(end_idx - num_latent_conditional_frames, 0)
++            gt_end = gt_start + num_video_frames
++    writer = None
++    if save_input_clip_path is not None:
++        save_path = Path(save_input_clip_path)
++        save_path.parent.mkdir(parents=True, exist_ok=True)
++        fps = float(video_metadata.get("fps", 30.0))
++        writer = imageio.get_writer(str(save_path), fps=fps)
++    for frame_idx, frame in enumerate(frame_iter):
++        if frame_idx < start_idx:
++            continue
++
++        in_input_window = end_idx is None or frame_idx < end_idx
++        if in_input_window:
++            selected_count += 1
++            tail_frames.append(frame)
++            if writer is not None:
++                writer.append_data(frame)
++
++        if gt_start is not None and gt_end is not None and gt_start <= frame_idx < gt_end:
++            gt_frames.append(frame)
++
++        if end_idx is not None and gt_end is not None and frame_idx >= max(end_idx, gt_end):
++            break
++        if end_idx is not None and gt_end is None and frame_idx >= end_idx:
++            break
++    if writer is not None:
++        writer.close()
++
++    if selected_count < frames_to_extract:
+         raise ValueError(
+-            f"Video has only {available_frames} frames but needs at least {frames_to_extract} frames for num_latent_conditional_frames={num_latent_conditional_frames}"
++            f"Selected video segment has only {selected_count} frames but needs at least {frames_to_extract} frames for num_latent_conditional_frames={num_latent_conditional_frames}"
+         )
+ 
++    log.info(f"Selected input video segment [{start_idx}, {end_idx}) with {selected_count} frames")
++
++    if save_gt_clip_path is not None and gt_start is not None and gt_end is not None:
++        save_path = Path(save_gt_clip_path)
++        save_path.parent.mkdir(parents=True, exist_ok=True)
++        fps = float(video_metadata.get("fps", 30.0))
++        gt_writer = imageio.get_writer(str(save_path), fps=fps)
++        gt_list = list(gt_frames)
++        if gt_list:
++            if len(gt_list) < num_video_frames:
++                last_frame = gt_list[-1]
++                pad_count = num_video_frames - len(gt_list)
++                gt_list.extend([last_frame] * pad_count)
++                log.info(f"Padded GT clip with {pad_count} frames to reach {num_video_frames} frames")
++            for frame in gt_list[-num_video_frames:]:
++                gt_writer.append_data(frame)
++        gt_writer.close()
++
++    extracted_frames = np.stack(tail_frames, axis=0)  # (T, H, W, C)
++
++    # Convert to uint8 tensor and downscale before float conversion to reduce memory pressure on 4K inputs.
++    video_tensor = torch.from_numpy(extracted_frames).permute(0, 3, 1, 2)  # (T, H, W, C) -> (T, C, H, W)
++    video_tensor = _maybe_downscale_video_for_io(video_tensor)
++    video_tensor = video_tensor.permute(1, 0, 2, 3).float() / 255.0  # (T, C, H, W) -> (C, T, H, W)
++
++    # Create output tensor with exact num_video_frames
++    C, _, H, W = video_tensor.shape
++    full_video = torch.zeros(C, num_video_frames, H, W)
++
+     # Extract the last frames_to_extract from input video
+-    start_idx = available_frames - frames_to_extract
+-    extracted_frames = video_tensor[:, start_idx:, :, :]
++    extracted_frames = video_tensor[:, -frames_to_extract:, :, :]
+     full_video[:, :frames_to_extract, :, :] = extracted_frames
+-    log.info(f"Extracted last {frames_to_extract} frames from video (frames {start_idx} to {available_frames - 1})")
++    log.info(f"Extracted last {frames_to_extract} frames from video segment")
+ 
+     # Pad remaining frames with the last extracted frame
+     if frames_to_extract < num_video_frames:
+@@ -350,7 +483,8 @@ class Video2WorldInference:
+             "video": video,
+             "camera": camera,
+             "action": action.unsqueeze(0) if action is not None else None,
+-            "fps": torch.randint(16, 32, (self.batch_size,)).float(),  # Random FPS (might be used by model)
++            # "fps": torch.randint(16, 32, (self.batch_size,)).float(),  # Random FPS (might be used by model)
++            "fps": torch.full((self.batch_size,), 30.0).float(),
+             "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
+             "num_conditional_frames": num_conditional_frames,  # Specify number of conditional frames
+         }
+@@ -386,6 +520,10 @@ class Video2WorldInference:
+         self,
+         prompt: str,
+         input_path: str | torch.Tensor | None,
++        input_frame_start: int | None = None,
++        input_frame_end: int | None = None,
++        save_input_clip_path: str | None = None,
++        save_gt_clip_path: str | None = None,
+         guidance: int = 7,
+         num_video_frames: int = 77,
+         num_latent_conditional_frames: int = 1,
+@@ -410,6 +548,8 @@ class Video2WorldInference:
+         Args:
+             prompt: The text prompt describing the desired video content/style.
+             input_path: Path to the input image or video file or a torch.Tensor.
++            input_frame_start: Inclusive start frame of the input video segment to use. Ignored for image/tensor inputs.
++            input_frame_end: Exclusive end frame of the input video segment to use. Ignored for image/tensor inputs.
+             guidance: Classifier-free guidance scale. Defaults to 7.
+             num_video_frames: Number of video frames to generate. Defaults to 77.
+             num_latent_conditional_frames : Number of latent conditional frames. Defaults to 1.
+@@ -464,6 +604,10 @@ class Video2WorldInference:
+                     resolution=video_resolution,
+                     num_video_frames=model_required_frames,
+                     num_latent_conditional_frames=num_latent_conditional_frames,
++                    input_frame_start=input_frame_start,
++                    input_frame_end=input_frame_end,
++                    save_input_clip_path=save_input_clip_path,
++                    save_gt_clip_path=save_gt_clip_path,
+                     resize=True,
+                 )
+             else:
+@@ -590,6 +734,8 @@ class Video2WorldInference:
+         num_output_frames: int,
+         chunk_size: int,
+         chunk_overlap: int,
++        input_frame_start: int | None = None,
++        input_frame_end: int | None = None,
+         guidance: int = 7,
+         num_latent_conditional_frames: int = 1,
+         resolution: str = "192,320",
+@@ -608,6 +754,8 @@ class Video2WorldInference:
+         Args:
+             prompt: The text prompt describing the desired video content/style.
+             input_path: Path to the input image or video file or a torch.Tensor.
++            input_frame_start: Inclusive start frame of the input video segment to use. Ignored for image/tensor inputs.
++            input_frame_end: Exclusive end frame of the input video segment to use. Ignored for image/tensor inputs.
+             num_output_frames: Total number of frames to generate in the final output.
+             chunk_size: Number of frames per chunk (model's native capacity).
+             chunk_overlap: Number of overlapping frames between chunks.
+@@ -664,6 +812,7 @@ class Video2WorldInference:
+                 video_frames, _ = easy_io.load(input_path)
+                 video_tensor = torch.from_numpy(video_frames).float() / 255.0
+                 video_tensor = video_tensor.permute(3, 0, 1, 2)  # (T, H, W, C) -> (C, T, H, W)
++                video_tensor = _slice_video_frames(video_tensor, input_frame_start, input_frame_end)
+                 available_frames = video_tensor.shape[1]
+ 
+                 # Calculate frames to extract
+@@ -772,6 +921,8 @@ class Video2WorldInference:
+             chunk_video = self.generate_vid2world(
+                 prompt=prompt,
+                 input_path=chunk_input,
++                input_frame_start=None,
++                input_frame_end=None,
+                 guidance=guidance,
+                 num_video_frames=model_required_frames,
+                 num_latent_conditional_frames=chunk_num_conditional,
+diff --git a/cosmos_predict2/config.py b/cosmos_predict2/config.py
+index d99dfee..f45a0cc 100644
+--- a/cosmos_predict2/config.py
++++ b/cosmos_predict2/config.py
+@@ -107,6 +107,15 @@ def _resolve_path(v: Path) -> Path:
+     return v.expanduser().absolute()
+ 
+ 
++def _validate_existing_path(v: Path) -> Path:
++    """Resolve path and ensure it exists."""
++    v = _resolve_path(v)
++    if not v.exists():
++        raise ValueError(f"Path '{v}' does not exist.")
++    return v
++
++
++ResolvedExistingPath = Annotated[Path, pydantic.AfterValidator(_validate_existing_path)]
+ ResolvedFilePath = Annotated[pydantic.FilePath, pydantic.AfterValidator(_resolve_path)]
+ ResolvedDirectoryPath = Annotated[pydantic.DirectoryPath, pydantic.AfterValidator(_resolve_path)]
+ 
+@@ -415,8 +424,12 @@ class InferenceArguments(CommonInferenceArguments):
+     # Required parameters
+     inference_type: tyro.conf.EnumChoicesFromValues[InferenceType]
+     """Inference type."""
+-    input_path: ResolvedFilePath | None = None
+-    """Optional and ignored for TEXT2WORLD. Required path to the image if inference_type is IMAGE2WORLD or video if inference_type is VIDEO2WORLD."""
++    input_path: ResolvedExistingPath | None = None
++    """Optional and ignored for TEXT2WORLD. Required path to the image/directory if inference_type is IMAGE2WORLD or video/directory if inference_type is VIDEO2WORLD."""
++    input_frame_start: int | None = None
++    """Optional inclusive start frame for selecting a video segment from input_path. Defaults to the beginning of the input video."""
++    input_frame_end: int | None = None
++    """Optional exclusive end frame for selecting a video segment from input_path. Defaults to the end of the input video."""
+ 
+     # Advanced parameters
+     resolution: str = "none"
+@@ -456,10 +469,25 @@ class InferenceArguments(CommonInferenceArguments):
+         if supported_extensions is not None:
+             if self.input_path is None:
+                 raise ValueError(f"input_path is required for inference type {self.inference_type}")
+-            if self.input_path.suffix not in supported_extensions:
++            if self.input_path.is_dir():
++                if self.inference_type not in (InferenceType.IMAGE2WORLD, InferenceType.VIDEO2WORLD):
++                    raise ValueError(
++                        f"input_path directory mode is only supported for {InferenceType.IMAGE2WORLD} and {InferenceType.VIDEO2WORLD}"
++                    )
++            elif self.input_path.suffix.lower() not in supported_extensions:
+                 raise ValueError(
+                     f"input_path has unsupported file extension '{self.input_path.suffix}' for inference type {self.inference_type}. Supported extensions: {supported_extensions}"
+                 )
++        if self.input_frame_start is not None and self.input_frame_start < 0:
++            raise ValueError("input_frame_start must be >= 0")
++        if self.input_frame_end is not None and self.input_frame_end < 0:
++            raise ValueError("input_frame_end must be >= 0")
++        if (
++            self.input_frame_start is not None
++            and self.input_frame_end is not None
++            and self.input_frame_end <= self.input_frame_start
++        ):
++            raise ValueError("input_frame_end must be greater than input_frame_start")
+         return self
+ 
+     @cached_property
+diff --git a/cosmos_predict2/inference.py b/cosmos_predict2/inference.py
+index 29d7ea5..fba0fd7 100644
+--- a/cosmos_predict2/inference.py
++++ b/cosmos_predict2/inference.py
+@@ -12,18 +12,18 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++import os
+ from pathlib import Path
+ 
+ import numpy as np
+ import torch
+ 
+-from cosmos_predict2._src.imaginaire.auxiliary.guardrail.common import presets as guardrail_presets
+ from cosmos_predict2._src.imaginaire.flags import SMOKE
+ from cosmos_predict2._src.imaginaire.lazy_config.lazy import LazyConfig
+ from cosmos_predict2._src.imaginaire.utils import distributed, log
+ from cosmos_predict2._src.imaginaire.visualize.video import save_img_or_video
+ from cosmos_predict2._src.predict2.inference.video2world import Video2WorldInference
+-from cosmos_predict2.config import InferenceArguments, SetupArguments, path_to_str
++from cosmos_predict2.config import InferenceArguments, InferenceType, SetupArguments, path_to_str
+ 
+ 
+ class Inference:
+@@ -47,7 +47,7 @@ class Inference:
+             context_parallel_size=args.context_parallel_size,
+             config_file=args.config_file,
+         )
+-        if self.rank0:
++        if self.rank0 and os.environ.get("COSMOS_VIDEO_ONLY_OUTPUT") != "1":
+             args.output_dir.mkdir(parents=True, exist_ok=True)
+             config_path = args.output_dir / "config.yaml"
+             # pyrefly: ignore  # bad-argument-type
+@@ -56,7 +56,11 @@ class Inference:
+ 
+         self.guardrail_enabled = not args.disable_guardrails
+ 
++        self.guardrail_presets = None
+         if self.rank0 and self.guardrail_enabled:
++            from cosmos_predict2._src.imaginaire.auxiliary.guardrail.common import presets as guardrail_presets
++
++            self.guardrail_presets = guardrail_presets
+             self.text_guardrail_runner = guardrail_presets.create_text_guardrail_runner(
+                 offload_model_to_cpu=args.offload_guardrail_models
+             )
+@@ -69,7 +73,9 @@ class Inference:
+             # pyrefly: ignore  # bad-assignment
+             self.video_guardrail_runner = None
+ 
+-    def generate(self, samples: list[InferenceArguments], output_dir: Path) -> list[str]:
++    def generate(
++        self, samples: list[InferenceArguments], output_dir: Path, *, save_prediction_only: bool = False
++    ) -> list[str]:
+         if SMOKE:
+             samples = samples[:1]
+ 
+@@ -79,23 +85,26 @@ class Inference:
+         output_paths: list[str] = []
+         for i_sample, sample in enumerate(samples):
+             log.info(f"[{i_sample + 1}/{len(samples)}] Processing sample {sample.name}")
+-            output_path = self._generate_sample(sample, output_dir)
++            output_path = self._generate_sample(sample, output_dir, save_prediction_only=save_prediction_only)
+             if output_path is not None:
+                 output_paths.append(output_path)
+         return output_paths
+ 
+-    def _generate_sample(self, sample: InferenceArguments, output_dir: Path) -> str | None:
++    def _generate_sample(
++        self, sample: InferenceArguments, output_dir: Path, *, save_prediction_only: bool = False
++    ) -> str | None:
+         log.debug(f"{sample.__class__.__name__}({sample})")
+         output_path = output_dir / sample.name
+ 
+         if self.rank0:
+             output_dir.mkdir(parents=True, exist_ok=True)
+-            open(f"{output_path}.json", "w").write(sample.model_dump_json())
+-            log.info(f"Saved arguments to {output_path}.json")
++            if not save_prediction_only:
++                open(f"{output_path}.json", "w").write(sample.model_dump_json())
++                log.info(f"Saved arguments to {output_path}.json")
+ 
+             # run text guardrail on the prompt
+             if self.text_guardrail_runner is not None:
+-                if not guardrail_presets.run_text_guardrail(sample.prompt, self.text_guardrail_runner):
++                if not self.guardrail_presets.run_text_guardrail(sample.prompt, self.text_guardrail_runner):
+                     message = f"Guardrail blocked text2world generation. Prompt: {sample.prompt}"
+                     log.critical(message)
+                     if self.setup_args.keep_going:
+@@ -114,6 +123,8 @@ class Inference:
+             video = self.pipe.generate_autoregressive_from_batch(
+                 prompt=sample.prompt,
+                 input_path=path_to_str(sample.input_path),
++                input_frame_start=sample.input_frame_start,
++                input_frame_end=sample.input_frame_end,
+                 num_output_frames=sample.num_output_frames,
+                 chunk_size=sample.chunk_size,
+                 chunk_overlap=sample.chunk_overlap,
+@@ -129,9 +140,17 @@ class Inference:
+             )
+         else:
+             log.info(f"Generating video with standard mode...")
++            save_input_clip_path = (
++                f"{output_path}_input_clip.mp4" if self.rank0 and not save_prediction_only else None
++            )
++            save_gt_clip_path = f"{output_path}_gt.mp4" if self.rank0 and not save_prediction_only else None
+             video = self.pipe.generate_vid2world(
+                 prompt=sample.prompt,
+                 input_path=path_to_str(sample.input_path),
++                input_frame_start=sample.input_frame_start,
++                input_frame_end=sample.input_frame_end,
++                save_input_clip_path=save_input_clip_path,
++                save_gt_clip_path=save_gt_clip_path,
+                 guidance=sample.guidance,
+                 num_video_frames=sample.num_output_frames,
+                 num_latent_conditional_frames=sample.num_input_frames,
+@@ -152,7 +171,7 @@ class Inference:
+                 log.info("Running guardrail check on video...")
+                 frames = (video * 255.0).clamp(0.0, 255.0).to(torch.uint8)
+                 frames = frames.permute(1, 2, 3, 0).cpu().numpy().astype(np.uint8)  # (T, H, W, C)
+-                processed_frames = guardrail_presets.run_video_guardrail(frames, self.video_guardrail_runner)
++                processed_frames = self.guardrail_presets.run_video_guardrail(frames, self.video_guardrail_runner)
+                 if processed_frames is None:
+                     message = "Guardrail blocked video2world generation."
+                     log.critical(message)
+@@ -168,6 +187,28 @@ class Inference:
+             else:
+                 log.warning("Guardrail checks on video are disabled")
+ 
+-            save_img_or_video(video, str(output_path), fps=16)
++            if save_prediction_only:
++                # The public interface expresses conditioning in latent frames.
++                # The Wan VAE maps N latent condition frames to
++                # 4 * (N - 1) + 1 pixel frames: I2W uses 1 -> 1, while V2W
++                # uses 2 -> 5. T2W has no conditioning frames. Drop every conditioned pixel frame so benchmark
++                # outputs contain generated future frames only.
++                num_condition_frames = (
++                    0
++                    if sample.inference_type == InferenceType.TEXT2WORLD
++                    else 4 * (sample.num_input_frames - 1) + 1
++                )
++                if video.shape[1] <= num_condition_frames:
++                    raise ValueError(
++                        f"Cannot save prediction-only output with {num_condition_frames} condition frames "
++                        f"from a {video.shape[1]}-frame video."
++                    )
++                if num_condition_frames:
++                    video = video[:, num_condition_frames:, :, :]
++                    log.info(f"Saving prediction-only video after dropping {num_condition_frames} condition frames")
++                else:
++                    log.info("Saving prediction-only video with no condition frames to drop")
++
++            save_img_or_video(video, str(output_path), fps=30)
+             log.success(f"Saved video to {output_path}.mp4")
+         return f"{output_path}.mp4"
+diff --git a/examples/inference.py b/examples/inference.py
+index 69612ea..56b7ffa 100644
+--- a/examples/inference.py
++++ b/examples/inference.py
+@@ -15,22 +15,37 @@
+ 
+ """Base model inference script."""
+ 
++import enum
++import json
++import os
++import re
+ from pathlib import Path
+-from typing import Annotated
++from typing import Annotated, Any
+ 
+ import pydantic
+ import tyro
+ from cosmos_oss.init import cleanup_environment, init_environment, init_output_dir
+ 
+ from cosmos_predict2.config import (
++    IMAGE_EXTENSIONS,
+     InferenceArguments,
++    InferenceType,
+     InferenceOverrides,
+     SetupArguments,
++    VIDEO_EXTENSIONS,
+     handle_tyro_exception,
+     is_rank0,
+ )
+ 
+ 
++class PromptMode(str, enum.Enum):
++    TASK_LEVEL = "task-level"
++    CLIP_LEVEL = "clip-level"
++
++    def __str__(self) -> str:
++        return self.value
++
++
+ class Args(pydantic.BaseModel):
+     model_config = pydantic.ConfigDict(extra="forbid", frozen=True)
+ 
+@@ -42,18 +57,319 @@ class Args(pydantic.BaseModel):
+     """Setup arguments. These can only be provided via CLI."""
+     overrides: InferenceOverrides
+     """Inference parameter overrides. These can either be provided in the input json file or via CLI. CLI overrides will overwrite the values in the input file."""
++    save_prediction_only: bool = False
++    """Save only predicted frames in the final output video. In video2world mode this drops the leading condition frames after inference."""
++    prompt_mode: tyro.conf.EnumChoicesFromValues[PromptMode] = PromptMode.TASK_LEVEL
++    """Prompt construction mode. task-level uses the prompt from the input file directly. clip-level fills clip text into the prompt template for each video."""
++    clip_prompt_dir: Path | None = None
++    """Directory containing per-clip prompt JSON files. Defaults to <input_path parent>/annotations/future_caption in clip-level mode."""
++    clip_prompt_field: str = ""
++    """Dot-separated field path for reading clip text from each prompt JSON file."""
++    clip_prompt_placeholder: str = "{clip_text_annotation}"
++    """Placeholder in the task prompt template to replace with per-clip text in clip-level mode."""
++
++
++I2W_FRAME_NAME = "frame_000200.jpg"
++
++
++def _get_by_field_path(data: Any, field_path: str, *, source_path: Path) -> Any:
++    value = data
++    traversed: list[str] = []
++    if not field_path:
++        return value
++    for part in field_path.split("."):
++        location = ".".join(traversed) or "<root>"
++        if isinstance(value, list):
++            try:
++                index = int(part)
++            except ValueError as exc:
++                raise ValueError(
++                    f"Invalid clip prompt field '{field_path}' for {source_path}: "
++                    f"expected a list index at '{location}', got '{part}'."
++                ) from exc
++            try:
++                value = value[index]
++            except IndexError as exc:
++                raise ValueError(
++                    f"Invalid clip prompt field '{field_path}' for {source_path}: "
++                    f"index {index} is out of range at '{location}' with list length {len(value)}."
++                ) from exc
++        elif isinstance(value, dict):
++            if part not in value:
++                keys = ", ".join(sorted(str(key) for key in value.keys()))
++                raise ValueError(
++                    f"Invalid clip prompt field '{field_path}' for {source_path}: "
++                    f"missing key '{part}' at '{location}'. Available keys: {keys}"
++                )
++            value = value[part]
++        else:
++            raise ValueError(
++                f"Invalid clip prompt field '{field_path}' for {source_path}: "
++                f"cannot read '{part}' at '{location}' from {type(value).__name__}."
++            )
++        traversed.append(part)
++    return value
++
++
++def _format_clip_response_json(value: dict[str, Any], *, source_path: Path, field_path: str) -> str:
++    missing = [key for key in ("weather", "environment", "caption") if key not in value]
++    if missing:
++        raise ValueError(
++            f"Expected weather/environment/caption at '{field_path}' in {source_path}; missing: {', '.join(missing)}"
++        )
++    return (
++        f"weather: {str(value['weather']).strip()} "
++        f"environment: {str(value['environment']).strip()} "
++        f"caption: {str(value['caption']).strip()}"
++    )
++
++
++def _read_clip_prompt(annotation_path: Path, field_path: str) -> str:
++    data = json.loads(annotation_path.read_text())
++    prompt = _get_by_field_path(data, field_path, source_path=annotation_path)
++    if isinstance(prompt, dict):
++        return _format_clip_response_json(prompt, source_path=annotation_path, field_path=field_path)
++    if not isinstance(prompt, str):
++        raise ValueError(
++            f"Expected a string or weather/environment/caption object at '{field_path}' in {annotation_path}, "
++            f"got {type(prompt).__name__}"
++        )
++    return prompt.strip()
++
++
++def _default_clip_prompt_dir(input_root: Path) -> Path:
++    return input_root.parent / "annotations" / "future_caption"
++
++
++def _clip_prompt_path(clip_path: Path, input_root: Path, clip_prompt_dir: Path) -> Path:
++    if clip_path.is_file() and clip_path.suffix.lower() == ".json":
++        return clip_path
++    relative_prompt_path = clip_prompt_dir / clip_path.relative_to(input_root).with_suffix(".json")
++    if relative_prompt_path.exists():
++        return relative_prompt_path
++    return clip_prompt_dir / f"{clip_path.stem}.json"
++
++
++def _apply_clip_prompt(
++    template: InferenceArguments,
++    *,
++    clip_path: Path,
++    input_root: Path,
++    clip_prompt_dir: Path | None,
++    clip_prompt_field: str,
++    clip_prompt_placeholder: str,
++) -> InferenceArguments:
++    prompt_dir = clip_prompt_dir or _default_clip_prompt_dir(input_root)
++    annotation_path = _clip_prompt_path(clip_path, input_root, prompt_dir)
++    if not annotation_path.exists():
++        raise ValueError(f"Clip prompt file not found for {clip_path}: expected {annotation_path}")
++
++    clip_prompt = _read_clip_prompt(annotation_path, clip_prompt_field)
++    if clip_prompt_placeholder not in template.prompt:
++        raise ValueError(
++            f"Clip prompt placeholder '{clip_prompt_placeholder}' not found in prompt template for sample '{template.name}'"
++        )
++
++    sample_data = template.model_dump()
++    sample_data["prompt"] = template.prompt.replace(clip_prompt_placeholder, clip_prompt)
++    return InferenceArguments.model_validate(sample_data)
++
++
++def _sample_name_from_video(video_path: Path, input_path: Path) -> str:
++    relative_stem = video_path.relative_to(input_path).with_suffix("").as_posix()
++    return re.sub(r"[^A-Za-z0-9_.-]+", "_", relative_stem).strip("_") or video_path.stem
++
++
++def _natural_path_key(path: Path) -> tuple[Any, ...]:
++    parts = re.split(r"(\d+)", path.name)
++    return tuple(int(part) if part.isdigit() else part.lower() for part in parts)
++
++
++def _image_paths_in_directory(path: Path) -> list[Path]:
++    return sorted(
++        (item for item in path.iterdir() if item.is_file() and item.suffix.lower() in IMAGE_EXTENSIONS),
++        key=_natural_path_key,
++    )
++
++
++def _select_i2w_frame(frame_dir: Path) -> Path | None:
++    image_path = frame_dir / I2W_FRAME_NAME
++    if image_path.is_file():
++        return image_path
++    if not _image_paths_in_directory(frame_dir):
++        return None
++    raise ValueError(f"Required image2world frame '{I2W_FRAME_NAME}' not found in frame directory {frame_dir}")
++
++
++def _expand_image_frame_directories(input_path: Path) -> list[tuple[str, Path, Path]]:
++    root_images = _image_paths_in_directory(input_path)
++    if root_images:
++        selected_frame = _select_i2w_frame(input_path)
++        if selected_frame is None:
++            return []
++        return [(_sample_name_from_video(input_path, input_path.parent), selected_frame, input_path)]
++
++    samples: list[tuple[str, Path, Path]] = []
++    for frame_dir in sorted((path for path in input_path.rglob("*") if path.is_dir()), key=lambda path: path.as_posix()):
++        selected_frame = _select_i2w_frame(frame_dir)
++        if selected_frame is None:
++            continue
++        name = _sample_name_from_video(frame_dir, input_path)
++        samples.append((name, selected_frame, frame_dir))
++    return samples
++
++
++def _expand_input_path_directories(
++    templates: list[InferenceArguments],
++    *,
++    prompt_mode: PromptMode,
++    clip_prompt_dir: Path | None,
++    clip_prompt_field: str,
++    clip_prompt_placeholder: str,
++) -> list[InferenceArguments]:
++    samples: list[InferenceArguments] = []
++    seen_names: set[str] = set()
++
++    for template in templates:
++        if template.input_path is None or not template.input_path.is_dir():
++            if template.name in seen_names:
++                raise ValueError(f"Duplicate output sample name '{template.name}'")
++            seen_names.add(template.name)
++            if prompt_mode == PromptMode.CLIP_LEVEL:
++                if template.input_path is None:
++                    raise ValueError("clip-level prompt mode requires input_path")
++                samples.append(
++                    _apply_clip_prompt(
++                        template,
++                        clip_path=template.input_path,
++                        input_root=template.input_path.parent,
++                        clip_prompt_dir=clip_prompt_dir,
++                        clip_prompt_field=clip_prompt_field,
++                        clip_prompt_placeholder=clip_prompt_placeholder,
++                    )
++                )
++            else:
++                samples.append(template)
++            continue
++
++        input_path = template.input_path.expanduser().resolve()
++        if template.inference_type == InferenceType.TEXT2WORLD:
++            if prompt_mode != PromptMode.CLIP_LEVEL:
++                raise ValueError("text2world directory mode is only supported with --prompt-mode clip-level")
++
++            annotation_files = sorted(path for path in input_path.rglob("*.json") if path.is_file())
++            if not annotation_files:
++                raise ValueError(f"No clip annotation JSON files found under {input_path}")
++
++            for annotation_path in annotation_files:
++                name = _sample_name_from_video(annotation_path, input_path)
++                if name in seen_names:
++                    raise ValueError(f"Duplicate output sample name '{name}' for annotation {annotation_path}")
++                seen_names.add(name)
++
++                sample_data = template.model_dump()
++                sample_data.update({"name": name, "input_path": None})
++                sample = InferenceArguments.model_validate(sample_data)
++                sample = _apply_clip_prompt(
++                    sample,
++                    clip_path=annotation_path,
++                    input_root=input_path,
++                    clip_prompt_dir=clip_prompt_dir or input_path,
++                    clip_prompt_field=clip_prompt_field,
++                    clip_prompt_placeholder=clip_prompt_placeholder,
++                )
++                samples.append(sample)
++
++            if is_rank0():
++                print(f"Found {len(annotation_files)} clip annotation files under {input_path}; running text2world clip-level prompts.")
++            continue
++
++        if template.inference_type == InferenceType.IMAGE2WORLD:
++            frame_samples = _expand_image_frame_directories(input_path)
++            if not frame_samples:
++                raise ValueError(f"No supported frame images found under {input_path}. Supported extensions: {IMAGE_EXTENSIONS}")
++
++            for name, image_path, frame_dir in frame_samples:
++                if name in seen_names:
++                    raise ValueError(f"Duplicate output sample name '{name}' for frame directory {frame_dir}")
++                seen_names.add(name)
++
++                sample_data = template.model_dump()
++                sample_data.update({"name": name, "input_path": image_path})
++                sample = InferenceArguments.model_validate(sample_data)
++                if prompt_mode == PromptMode.CLIP_LEVEL:
++                    sample = _apply_clip_prompt(
++                        sample,
++                        clip_path=frame_dir,
++                        input_root=input_path,
++                        clip_prompt_dir=clip_prompt_dir,
++                        clip_prompt_field=clip_prompt_field,
++                        clip_prompt_placeholder=clip_prompt_placeholder,
++                    )
++                samples.append(sample)
++
++            if is_rank0():
++                print(f"Found {len(frame_samples)} frame folders under {input_path}; using {I2W_FRAME_NAME} from each.")
++            continue
++
++        videos = sorted(
++            path for path in input_path.rglob("*") if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
++        )
++        if not videos:
++            raise ValueError(f"No supported videos found in {input_path}. Supported extensions: {VIDEO_EXTENSIONS}")
++
++        for video_path in videos:
++            name = _sample_name_from_video(video_path, input_path)
++            if name in seen_names:
++                raise ValueError(f"Duplicate output sample name '{name}' for video {video_path}")
++            seen_names.add(name)
++
++            sample_data = template.model_dump()
++            sample_data.update({"name": name, "input_path": video_path})
++            sample = InferenceArguments.model_validate(sample_data)
++            if prompt_mode == PromptMode.CLIP_LEVEL:
++                sample = _apply_clip_prompt(
++                    sample,
++                    clip_path=video_path,
++                    input_root=input_path,
++                    clip_prompt_dir=clip_prompt_dir,
++                    clip_prompt_field=clip_prompt_field,
++                    clip_prompt_placeholder=clip_prompt_placeholder,
++                )
++            samples.append(sample)
++
++        if is_rank0():
++            print(f"Found {len(videos)} videos under {input_path}; running them recursively.")
++
++    return samples
+ 
+ 
+ def main(
+     args: Args,
+ ):
+     inference_samples = InferenceArguments.from_files(args.input_files, overrides=args.overrides)
+-    init_output_dir(args.setup.output_dir, profile=args.setup.profile)
++    inference_samples = _expand_input_path_directories(
++        inference_samples,
++        prompt_mode=args.prompt_mode,
++        clip_prompt_dir=args.clip_prompt_dir,
++        clip_prompt_field=args.clip_prompt_field,
++        clip_prompt_placeholder=args.clip_prompt_placeholder,
++    )
++    runtime_output_dir = args.setup.output_dir
++    if args.save_prediction_only:
++        configured_log_dir = os.environ.get("COSMOS_RUNTIME_LOG_DIR")
++        if configured_log_dir:
++            runtime_output_dir = Path(configured_log_dir)
++    init_output_dir(runtime_output_dir, profile=args.setup.profile)
+ 
+     from cosmos_predict2.inference import Inference
+ 
+     inference = Inference(args.setup)
+-    inference.generate(inference_samples, output_dir=args.setup.output_dir)
++    inference.generate(
++        inference_samples,
++        output_dir=args.setup.output_dir,
++        save_prediction_only=args.save_prediction_only,
++    )
+ 
+ 
+ if __name__ == "__main__":

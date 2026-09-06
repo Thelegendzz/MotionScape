@@ -1,0 +1,4 @@
+You are given one observed image from a dynamic UAV-view scene and a textual description of the future frames. Your task is to generate the future video frames that most plausibly follow the observed image while matching the provided future-frame description. The generated video should preserve the scene layout, visual appearance, viewpoint, and initial camera state implied by the observed image, and should evolve smoothly according to the described future motion. Maintain coherent camera dynamics, stable temporal progression, and consistent scene geometry. Avoid abrupt viewpoint changes, sudden motion-scale shifts, unrealistic acceleration or deceleration, and temporal blur.
+
+The future frames are described as follows:
+{clip_text_annotation}
