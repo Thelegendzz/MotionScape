@@ -144,8 +144,8 @@ The temporal inference settings used in the benchmark are:
 
 | Model / task | # Cond. Frames | Condition Sampling | Native FPS | # Output Frames |
 |---|---:|---|---:|---:|
-| Cosmos-Predict2.5-2B (T2W / I2W / V2W) | 0 / 1 / 5 | V2W: consecutive | 30 | 88 |
-| CogVideoX1.5-5B (T2W / I2W) | 0 / 1 | N/A | 16 | 40 |
+| Cosmos-Predict2.5-2B (T2W / I2W / V2W) | 0 / 1 / 5 | V2W: consecutive | 30 | 93 / 92 / 88 |
+| CogVideoX1.5-5B (T2W / I2W) | 0 / 1 | N/A | 16 | 41 |
 | Wan2.2-A14B (T2W / I2W) | 0 / 1 | N/A | 16 | 40 |
 | LongCat-Video (V2W) | 13 | Every 2 source frames | 15 | 40 |
 | MAGI-1-24B (V2W) | 32 | Every 2 source frames | 16 | 40 |
